@@ -5,10 +5,9 @@ import datetime
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
-today = datetime.date.today().strftime("%Y-%m-%d")
 
 # --- Universe ---
-symbolstop = [
+SYMBOLS = [
     "RELIANCE.NS","TCS.NS","HDFCBANK.NS","ICICIBANK.NS","INFY.NS",
     "ITC.NS","HINDUNILVR.NS","SBIN.NS","BHARTIARTL.NS","KOTAKBANK.NS",
     "LT.NS","AXISBANK.NS","ASIANPAINT.NS","MARUTI.NS","SUNPHARMA.NS",
@@ -47,88 +46,97 @@ symbolstop = [
 ]
 
 # --- Params ---
-lookback          = 252
-skip              = 21      # skip last month (standard 12-1 momentum)
-holding           = 21
-top_pct           = 0.2
-cost_per_trade    = 0.001   # 0.1% per leg (buy + sell = 0.2% round trip per rebalance)
+LOOKBACK       = 252
+SKIP           = 21      # skip last month (standard 12-1 momentum)
+HOLDING        = 21
+TOP_PCT        = 0.2
+COST_PER_TRADE = 0.001   # 0.1% per leg (buy + sell = 0.2% round trip per rebalance)
+START_DATE     = "2018-01-01"
+TODAY          = datetime.date.today().strftime("%Y-%m-%d")
 
-# --- Data ---
-prices_raw = yf.download(symbolstop, start="2018-01-01", end=today)["Close"]
-market_raw = yf.download("^NSEI",    start="2018-01-01", end=today)["Close"].squeeze()
 
-stock_ret_raw  = prices_raw.pct_change()
-market_ret_raw = market_raw.pct_change()
+def download_data(symbols, start, end):
+    prices_raw = yf.download(symbols, start=start, end=end)["Close"]
+    market_raw = yf.download("^NSEI", start=start, end=end)["Close"].squeeze()
+    return prices_raw, market_raw
 
-# --- Align ---
-data = stock_ret_raw.join(market_ret_raw.rename("MKT"), how="inner")
-data = data[data["MKT"].notna()]
 
-dates      = data.index
-stock_ret  = data[symbolstop]
-market_ret = data["MKT"]
-prices     = prices_raw.reindex(dates)
+def align_data(prices_raw, market_raw, symbols):
+    stock_ret_raw  = prices_raw.pct_change()
+    market_ret_raw = market_raw.pct_change()
 
-T, N = stock_ret.shape
+    data = stock_ret_raw.join(market_ret_raw.rename("MKT"), how="inner")
+    data = data[data["MKT"].notna()]
 
-print(f"Data shape : {data.shape}")
-print(f"Date range : {dates[0].date()} -> {dates[-1].date()}")
-print(f"T={T}, lookback={lookback}, holding={holding}")
-print(f"Expected rebalances: {len(range(lookback, T - holding, holding))}\n")
+    dates      = data.index
+    stock_ret  = data[symbols]
+    market_ret = data["MKT"]
+    prices     = prices_raw.reindex(dates)
 
-portfolio_returns = pd.Series(index=dates, dtype=float)
-prev_weights      = pd.Series(0.0, index=stock_ret.columns)  # track previous weights for turnover cost
+    T, N = stock_ret.shape
+    print(f"Data shape : {data.shape}")
+    print(f"Date range : {dates[0].date()} -> {dates[-1].date()}")
+    print(f"T={T}, lookback={LOOKBACK}, holding={HOLDING}")
+    print(f"Expected rebalances: {len(range(LOOKBACK, T - HOLDING, HOLDING))}\n")
 
-# --- Rolling Backtest ---
-for t in range(lookback, T - holding, holding):
-    print(f"Rebalancing at t={t} ({dates[t].date()})")
+    return dates, stock_ret, market_ret, prices, T
 
-    # 12-1 momentum: return from [t-252] to [t-21]
+
+def compute_weights(t, prices, stock_ret, lookback, skip, top_pct):
     try:
         ret_12m = (prices.iloc[t - skip] / prices.iloc[t - lookback]) - 1
     except Exception:
-        continue
+        return None, None
 
     ret_12m = ret_12m.dropna()
     if len(ret_12m) < 10:
         print("  Skipping - too few stocks")
-        continue
+        return None, None
 
-    # --- Rank: long top 20% by momentum ---
     ranking     = ret_12m.sort_values(ascending=False)
     k           = max(1, int(top_pct * len(ranking)))
     long_stocks = ranking.head(k).index
 
     print(f"  k={k} | Long: {list(long_stocks[:5])} ...")
 
-    # --- Volatility-adjusted weights, normalised to sum = 1 ---
     vol = stock_ret.iloc[t - lookback:t].std().replace(0, np.nan)
     weights = pd.Series(0.0, index=stock_ret.columns)
     weights[long_stocks] = 1.0 / vol[long_stocks]
     weights = weights / weights.sum()
 
-    # --- Transaction cost: proportional to turnover vs previous weights ---
-    # Turnover = sum of absolute weight changes; cost applied on rebalance day
-    turnover = (weights - prev_weights).abs().sum()
-    cost_this_rebalance = cost_per_trade * turnover   # scales with how much you actually trade
-    prev_weights = weights.copy()
+    return weights, k
 
-    # --- Apply weights + deduct cost on first day of holding period ---
-    for h in range(holding):
-        idx = t + h
-        if idx < T:
-            day_ret = stock_ret.iloc[idx].fillna(0)
-            port_ret = (weights * day_ret).sum()
-            if h == 0:
-                port_ret -= cost_this_rebalance  # deduct cost on rebalance day only
-            portfolio_returns.iloc[idx] = port_ret
 
-# --- Results ---
-portfolio_returns = portfolio_returns.dropna()
+def run_backtest(dates, stock_ret, prices, T):
+    portfolio_returns = pd.Series(index=dates, dtype=float)
+    prev_weights      = pd.Series(0.0, index=stock_ret.columns)
 
-if len(portfolio_returns) == 0:
-    print("\nNo trades executed")
-else:
+    for t in range(LOOKBACK, T - HOLDING, HOLDING):
+        print(f"Rebalancing at t={t} ({dates[t].date()})")
+
+        weights, k = compute_weights(t, prices, stock_ret, LOOKBACK, SKIP, TOP_PCT)
+        if weights is None:
+            continue
+
+        # Transaction cost: proportional to turnover vs previous weights
+        turnover            = (weights - prev_weights).abs().sum()
+        cost_this_rebalance = COST_PER_TRADE * turnover
+        prev_weights        = weights.copy()
+
+        # Apply weights + deduct cost on first day of holding period
+        for h in range(HOLDING):
+            idx = t + h
+            if idx < T:
+                day_ret  = stock_ret.iloc[idx].fillna(0)
+                port_ret = (weights * day_ret).sum()
+                if h == 0:
+                    port_ret -= cost_this_rebalance
+                portfolio_returns.iloc[idx] = port_ret
+
+    return portfolio_returns.dropna()
+
+
+def compute_metrics(portfolio_returns, market_ret):
     cum        = (1 + portfolio_returns).cumprod()
     annual_ret = portfolio_returns.mean() * 252
     sharpe     = (portfolio_returns.mean() / portfolio_returns.std()) * np.sqrt(252)
@@ -136,10 +144,14 @@ else:
     drawdown   = (cum - peak) / peak
     max_dd     = drawdown.min()
 
-    nifty_ret_aligned = nifty_returns = market_ret.reindex(portfolio_returns.index).fillna(0)
-    nifty_cum  = (1 + nifty_ret_aligned).cumprod()
-    nifty_ann  = nifty_ret_aligned.mean() * 252
+    nifty_ret_aligned = market_ret.reindex(portfolio_returns.index).fillna(0)
+    nifty_cum         = (1 + nifty_ret_aligned).cumprod()
+    nifty_ann         = nifty_ret_aligned.mean() * 252
 
+    return cum, annual_ret, sharpe, drawdown, max_dd, nifty_cum, nifty_ann
+
+
+def print_results(cum, annual_ret, sharpe, max_dd, nifty_ann):
     print("\n========== STRATEGY PERFORMANCE ==========")
     print(f"Final Cumulative Return : {cum.iloc[-1] - 1:.2%}")
     print(f"Annualised Return       : {annual_ret:.2%}")
@@ -149,7 +161,8 @@ else:
     print(f"Nifty Annualised Return : {nifty_ann:.2%}")
     print(f"Excess Return (Alpha)   : {annual_ret - nifty_ann:.2%}")
 
-    # --- Plot ---
+
+def plot_results(cum, portfolio_returns, drawdown, nifty_cum):
     fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
     fig.suptitle("Long-Only Momentum Strategy vs Nifty (NSE)", fontsize=14, fontweight="bold")
 
@@ -182,3 +195,25 @@ else:
     plt.savefig("strategy_performance.png", dpi=150, bbox_inches="tight")
     plt.show()
     print("\nChart saved to strategy_performance.png")
+
+
+def main():
+    prices_raw, market_raw = download_data(SYMBOLS, START_DATE, TODAY)
+    dates, stock_ret, market_ret, prices, T = align_data(prices_raw, market_raw, SYMBOLS)
+
+    portfolio_returns = run_backtest(dates, stock_ret, prices, T)
+
+    if len(portfolio_returns) == 0:
+        print("\nNo trades executed")
+        return
+
+    cum, annual_ret, sharpe, drawdown, max_dd, nifty_cum, nifty_ann = compute_metrics(
+        portfolio_returns, market_ret
+    )
+
+    print_results(cum, annual_ret, sharpe, max_dd, nifty_ann)
+    plot_results(cum, portfolio_returns, drawdown, nifty_cum)
+
+
+if __name__ == "__main__":
+    main()
